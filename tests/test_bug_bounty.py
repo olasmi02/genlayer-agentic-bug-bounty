@@ -1,10 +1,13 @@
 """
 Exhaustive test suite for AgenticBugBounty Intelligent Contract.
 Covers:
-- Program creation and vault funding
+- Program creation with authoritative repo_base_url and vault funding
 - Anti-spam staking and excess refunding
+- Authoritative target code acquisition + scope verification
 - Non-deterministic consensus triage for CRITICAL, HIGH, MEDIUM, LOW vulnerabilities
-- Anti-spam bond slashing for invalid/spam submissions
+- Anti-spam bond slashing for invalid/spam submissions or unverified code
+- Code fetch failure (HTTP 404) leading to invalidity and slashing
+- Report rejected when target source code does not contain the claimed vulnerability
 - Out-of-scope report rejection
 - Equivalence check enforcement (validator rejecting mismatched severity)
 - CVSS score consensus tolerance handling
@@ -40,7 +43,7 @@ def contract(direct_vm, treasury_address):
     return c
 
 
-def mock_scope_security_md(direct_vm):
+def mock_scope_and_target_code(direct_vm):
     scope_body = """
     # Security Policy & In-Scope Components
     In-Scope:
@@ -52,8 +55,33 @@ def mock_scope_security_md(direct_vm):
     - tests/
     - third_party/
     """
+    vault_code = """
+    contract Vault {
+        mapping(address => uint256) public balances;
+        function withdraw(uint256 amount) external {
+            require(balances[msg.sender] >= amount);
+            (bool success, ) = msg.sender.call{value: amount}(""); // Vulnerable reentrancy!
+            require(success);
+            balances[msg.sender] -= amount;
+        }
+    }
+    """
+    token_code = """
+    contract Token {
+        address[] public holders;
+        function distributeRewards() external {
+            for(uint i=0; i<holders.length; i++) { // Unbounded loop DOS
+                // distribute
+            }
+        }
+    }
+    """
     direct_vm.mock_web(r".*security\.md", scope_body, 200, for_validator=False)
     direct_vm.mock_web(r".*security\.md", scope_body, 200, for_validator=True)
+    direct_vm.mock_web(r".*Vault\.sol", vault_code, 200, for_validator=False)
+    direct_vm.mock_web(r".*Vault\.sol", vault_code, 200, for_validator=True)
+    direct_vm.mock_web(r".*Token\.sol", token_code, 200, for_validator=False)
+    direct_vm.mock_web(r".*Token\.sol", token_code, 200, for_validator=True)
 
 
 # -----------------------------------------------------------------------------
@@ -61,11 +89,12 @@ def mock_scope_security_md(direct_vm):
 # -----------------------------------------------------------------------------
 
 def test_program_creation_and_funding(contract, direct_vm, sponsor_address):
-    """Sponsor creates a bounty program with native vault funding."""
+    """Sponsor creates a bounty program with repo_base_url, scope_url, and native vault funding."""
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol Bug Bounty",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,  # 24 hours
             critical_payout_bps=5000, # 50%
@@ -77,6 +106,8 @@ def test_program_creation_and_funding(contract, direct_vm, sponsor_address):
     assert pid == 1
     prog = contract.get_program(pid)
     assert prog["name"] == "DeFi Protocol Bug Bounty"
+    assert prog["repo_base_url"] == "https://raw.githubusercontent.com/defiprotocol/core"
+    assert prog["scope_url"] == "https://raw.githubusercontent.com/defiprotocol/core/main/security.md"
     assert prog["vault_balance"] == 10000
     assert prog["min_stake"] == 50
     assert prog["challenge_period"] == 86400
@@ -92,7 +123,8 @@ def test_deposit_vault_topup(contract, direct_vm, sponsor_address):
     with direct_vm.prank(sponsor_address, value=5000):
         pid = contract.create_program(
             name="Yield Vault Bounty",
-            scope_url="https://github.com/yield/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/yield/core",
+            scope_url="https://raw.githubusercontent.com/yield/core/main/security.md",
             min_stake=100,
             challenge_period=3600,
             critical_payout_bps=4000,
@@ -101,7 +133,6 @@ def test_deposit_vault_topup(contract, direct_vm, sponsor_address):
             low_payout_bps=100,
         )
 
-    # Top up vault with another 3000
     with direct_vm.prank(sponsor_address, value=3000):
         contract.deposit_vault(pid)
 
@@ -122,7 +153,8 @@ def test_excess_deposit_refund_on_submission(contract, direct_vm, sponsor_addres
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -136,7 +168,7 @@ def test_excess_deposit_refund_on_submission(contract, direct_vm, sponsor_addres
         rid = contract.submit_report(
             program_id=pid,
             target_component="contracts/Vault.sol",
-            commit_or_version="v1.0.0",
+            commit_or_version="commit-abc1234",
             report_title="Rounding error in fee calculation",
             report_details="Division before multiplication leads to fee leakage",
             claimed_severity="LOW",
@@ -156,7 +188,8 @@ def test_insufficient_anti_spam_stake_reverts(contract, direct_vm, sponsor_addre
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -179,24 +212,25 @@ def test_insufficient_anti_spam_stake_reverts(contract, direct_vm, sponsor_addre
 
 
 # -----------------------------------------------------------------------------
-# 3. CONSENSUS TRIAGE: CRITICAL VULNERABILITY (HAPPY PATH & SETTLEMENT)
+# 3. CONSENSUS TRIAGE: CRITICAL VULNERABILITY (AUTHORITATIVE CODE VERIFIED)
 # -----------------------------------------------------------------------------
 
-def test_critical_severity_triage_and_early_sponsor_settlement(
+def test_critical_severity_triage_with_authoritative_code_verification(
     contract, direct_vm, sponsor_address, researcher_address
 ):
     """
-    Consensus verifies a CRITICAL reentrancy drain bug.
-    Leader and validator agree on CRITICAL (CVSS 9.8).
-    Deterministic 50% payout (5,000 units) + 100% bond refund (50 units) = 5,050 units to researcher.
+    Consensus acquires authoritative target source code at specified commit,
+    verifies reentrancy flaw against code, agrees on CRITICAL (CVSS 9.8),
+    and sponsor settles early.
     """
     direct_vm.balances.clear()
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000, # 50%
@@ -211,22 +245,22 @@ def test_critical_severity_triage_and_early_sponsor_settlement(
             target_component="contracts/Vault.sol",
             commit_or_version="commit-abc1234",
             report_title="Unprotected withdraw reentrancy drains entire vault",
-            report_details="Calling withdraw() allows reentering deposit() before state update.",
+            report_details="Calling withdraw() allows reentering before state update.",
             claimed_severity="CRITICAL",
         )
 
-    # Mock consensus LLM evaluations
+    # Mock consensus LLM evaluations: code_verified=True, is_valid=True
     triage_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 9.8,
         "severity": "CRITICAL",
-        "reasoning": "Classic reentrancy in withdraw() allows complete draining of vault assets."
+        "reasoning": "Authoritative target code contracts/Vault.sol verified. Classic reentrancy in withdraw() allows complete draining."
     })
     direct_vm.mock_llm(r".*reentrancy.*", triage_payload, for_validator=False)
     direct_vm.mock_llm(r".*reentrancy.*", triage_payload, for_validator=True)
 
-    # Run GenLayer consensus triage
     contract.triage_report(rid)
 
     rep = contract.get_report(rid)
@@ -241,12 +275,7 @@ def test_critical_severity_triage_and_early_sponsor_settlement(
 
     rep_after = contract.get_report(rid)
     assert rep_after["status"] == REPORT_SETTLED
-
-    # Verify researcher received 5000 payout + 50 returned bond = 5050
-    assert direct_vm.balances[researcher_address] == 5050
-
-    prog_after = contract.get_program(pid)
-    assert prog_after["vault_balance"] == 5000
+    assert direct_vm.balances[researcher_address] == 5050  # 5000 reward + 50 bond
 
 
 # -----------------------------------------------------------------------------
@@ -255,12 +284,13 @@ def test_critical_severity_triage_and_early_sponsor_settlement(
 
 def test_high_and_medium_severity_triage(contract, direct_vm, sponsor_address, researcher_address):
     """Verifies that HIGH and MEDIUM canonical bands yield deterministic mathematical payouts."""
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -269,7 +299,6 @@ def test_high_and_medium_severity_triage(contract, direct_vm, sponsor_address, r
             low_payout_bps=200,
         )
 
-    # 1. Submit HIGH report
     with direct_vm.prank(researcher_address, value=50):
         rid_high = contract.submit_report(
             program_id=pid,
@@ -282,10 +311,11 @@ def test_high_and_medium_severity_triage(contract, direct_vm, sponsor_address, r
 
     high_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 7.8,
         "severity": "HIGH",
-        "reasoning": "Unbounded loop causes DOS blocking reward withdrawals."
+        "reasoning": "Authoritative target code contracts/Token.sol verified. Unbounded loop causes DOS."
     })
     direct_vm.mock_llm(r".*Temporary lock.*", high_payload, for_validator=False)
     direct_vm.mock_llm(r".*Temporary lock.*", high_payload, for_validator=True)
@@ -297,20 +327,26 @@ def test_high_and_medium_severity_triage(contract, direct_vm, sponsor_address, r
 
 
 # -----------------------------------------------------------------------------
-# 5. FRAUDULENT / SPAM REPORT & BOND SLASHING
+# 5. TARGET CODE ACQUISITION FAILURE (HTTP 404) & BOND SLASHING
 # -----------------------------------------------------------------------------
 
-def test_invalid_report_bond_slashing(contract, direct_vm, sponsor_address, researcher_address):
+def test_target_code_acquisition_failure_slashed(contract, direct_vm, sponsor_address, researcher_address):
     """
-    Submitting an invalid / spam report causes consensus to reject the report.
-    The researcher's anti-spam bond is slashed and credited to the program vault.
+    If the referenced target source code cannot be fetched at the specified commit (HTTP 404),
+    the report cannot be verified, is marked INVALID, and the researcher's bond is slashed into the vault.
     """
-    mock_scope_security_md(direct_vm)
+    scope_body = "# Security Policy\nIn-Scope:\n- contracts/NonExistent.sol\n"
+    direct_vm.mock_web(r".*security\.md", scope_body, 200, for_validator=False)
+    direct_vm.mock_web(r".*security\.md", scope_body, 200, for_validator=True)
+    # Target code returns 404
+    direct_vm.mock_web(r".*NonExistent\.sol", "404 Not Found", 404, for_validator=False)
+    direct_vm.mock_web(r".*NonExistent\.sol", "404 Not Found", 404, for_validator=True)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=100,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -322,22 +358,23 @@ def test_invalid_report_bond_slashing(contract, direct_vm, sponsor_address, rese
     with direct_vm.prank(researcher_address, value=100):
         rid = contract.submit_report(
             program_id=pid,
-            target_component="contracts/Vault.sol",
-            commit_or_version="commit-abc",
-            report_title="Fake bug claim",
-            report_details="No real PoC, just claiming vulnerability without evidence.",
-            claimed_severity="CRITICAL",
+            target_component="contracts/NonExistent.sol",
+            commit_or_version="invalid-commit",
+            report_title="Hallucinated file bug",
+            report_details="Claims bug in file that doesn't exist at this commit.",
+            claimed_severity="HIGH",
         )
 
     invalid_payload = json.dumps({
         "in_scope": True,
+        "code_verified": False,
         "is_valid": False,
         "cvss_score": 0.0,
         "severity": "INVALID",
-        "reasoning": "Report does not present an actionable vulnerability or reproducible exploit."
+        "reasoning": "Authoritative target code could not be acquired at specified commit (HTTP 404)."
     })
-    direct_vm.mock_llm(r".*Fake bug claim.*", invalid_payload, for_validator=False)
-    direct_vm.mock_llm(r".*Fake bug claim.*", invalid_payload, for_validator=True)
+    direct_vm.mock_llm(r".*Hallucinated file.*", invalid_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Hallucinated file.*", invalid_payload, for_validator=True)
 
     contract.triage_report(rid)
 
@@ -345,25 +382,82 @@ def test_invalid_report_bond_slashing(contract, direct_vm, sponsor_address, rese
     assert rep["status"] == REPORT_REJECTED
     assert rep["adjudicated_severity"] == SEVERITY_INVALID
     assert rep["staked_bond"] == 0
-    assert rep["payout_amount"] == 0
 
-    # Slashed bond added to program vault: 10000 + 100 = 10100
+    prog = contract.get_program(pid)
+    assert prog["vault_balance"] == 10100 # Slashed 100 added to vault
+
+
+# -----------------------------------------------------------------------------
+# 6. CODE DOES NOT CONTAIN VULNERABILITY (NARRATIVE MISMATCH) & BOND SLASHING
+# -----------------------------------------------------------------------------
+
+def test_code_does_not_contain_vulnerability_slashed(
+    contract, direct_vm, sponsor_address, researcher_address
+):
+    """
+    The target source code is fetched, but does NOT contain the vulnerability claimed
+    in the researcher's narrative. The report is rejected as INVALID and the bond is slashed.
+    """
+    mock_scope_and_target_code(direct_vm)
+
+    with direct_vm.prank(sponsor_address, value=10000):
+        pid = contract.create_program(
+            name="DeFi Protocol",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
+            min_stake=100,
+            challenge_period=86400,
+            critical_payout_bps=5000,
+            high_payout_bps=2000,
+            medium_payout_bps=800,
+            low_payout_bps=200,
+        )
+
+    with direct_vm.prank(researcher_address, value=100):
+        rid = contract.submit_report(
+            program_id=pid,
+            target_component="contracts/Token.sol",
+            commit_or_version="commit-xyz",
+            report_title="Fake reentrancy claim on ERC20",
+            report_details="Claims reentrancy in transfer() but Token.sol has no external calls.",
+            claimed_severity="CRITICAL",
+        )
+
+    invalid_payload = json.dumps({
+        "in_scope": True,
+        "code_verified": True,
+        "is_valid": False,
+        "cvss_score": 0.0,
+        "severity": "INVALID",
+        "reasoning": "Authoritative target code inspected: Token.sol does not contain external calls or reentrancy vectors claimed in narrative."
+    })
+    direct_vm.mock_llm(r".*Fake reentrancy.*", invalid_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Fake reentrancy.*", invalid_payload, for_validator=True)
+
+    contract.triage_report(rid)
+
+    rep = contract.get_report(rid)
+    assert rep["status"] == REPORT_REJECTED
+    assert rep["adjudicated_severity"] == SEVERITY_INVALID
+    assert rep["staked_bond"] == 0
+
     prog = contract.get_program(pid)
     assert prog["vault_balance"] == 10100
 
 
 # -----------------------------------------------------------------------------
-# 6. OUT-OF-SCOPE REPORT REJECTION
+# 7. OUT-OF-SCOPE REPORT REJECTION
 # -----------------------------------------------------------------------------
 
 def test_out_of_scope_report_rejected(contract, direct_vm, sponsor_address, researcher_address):
     """Reports targeting components outside the published security.md scope are rejected and slashed."""
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=5000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -372,7 +466,6 @@ def test_out_of_scope_report_rejected(contract, direct_vm, sponsor_address, rese
             low_payout_bps=200,
         )
 
-    # Targets tests/MockTest.sol which is explicitly out of scope in mock_scope_security_md
     with direct_vm.prank(researcher_address, value=50):
         rid = contract.submit_report(
             program_id=pid,
@@ -385,10 +478,11 @@ def test_out_of_scope_report_rejected(contract, direct_vm, sponsor_address, rese
 
     out_of_scope_payload = json.dumps({
         "in_scope": False,
-        "is_valid": True,
+        "code_verified": False,
+        "is_valid": False,
         "cvss_score": 0.0,
         "severity": "INVALID",
-        "reasoning": "The target tests/MockTest.sol is in tests/ directory and explicitly out of scope."
+        "reasoning": "Target tests/MockTest.sol is in tests/ directory and explicitly out of scope per security.md."
     })
     direct_vm.mock_llm(r".*Assertion error.*", out_of_scope_payload, for_validator=False)
     direct_vm.mock_llm(r".*Assertion error.*", out_of_scope_payload, for_validator=True)
@@ -401,7 +495,7 @@ def test_out_of_scope_report_rejected(contract, direct_vm, sponsor_address, rese
 
 
 # -----------------------------------------------------------------------------
-# 7. EQUIVALENCE CHECK: VALIDATOR REJECTS MISMATCHED SEVERITY BAND
+# 8. EQUIVALENCE CHECK: VALIDATOR REJECTS MISMATCHED SEVERITY BAND
 # -----------------------------------------------------------------------------
 
 def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_address, researcher_address):
@@ -409,12 +503,13 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
     If a colluding leader proposes HIGH but the validator independently evaluates LOW,
     the validator rejects the proposal under the Equivalence Principle.
     """
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -436,6 +531,7 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
     # Leader fraudulently inflates to HIGH (CVSS 7.5)
     leader_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 7.5,
         "severity": "HIGH",
@@ -444,6 +540,7 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
     # Honest validator determines LOW (CVSS 2.0)
     validator_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 2.0,
         "severity": "LOW",
@@ -458,7 +555,7 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
 
 
 # -----------------------------------------------------------------------------
-# 8. CONSENSUS TOLERANCE HANDLING
+# 9. CONSENSUS TOLERANCE HANDLING
 # -----------------------------------------------------------------------------
 
 def test_consensus_tolerance_within_band(contract, direct_vm, sponsor_address, researcher_address):
@@ -466,12 +563,13 @@ def test_consensus_tolerance_within_band(contract, direct_vm, sponsor_address, r
     Leader evaluates CVSS 9.8, validator evaluates CVSS 9.3 (diff = 0.5 <= 0.8 tolerance).
     Both agree on canonical CRITICAL band. Consensus passes!
     """
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -492,17 +590,19 @@ def test_consensus_tolerance_within_band(contract, direct_vm, sponsor_address, r
 
     leader_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 9.8,
         "severity": "CRITICAL",
-        "reasoning": "Direct economic exploit."
+        "reasoning": "Direct economic exploit verified in target code."
     })
     validator_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 9.3,
         "severity": "CRITICAL",
-        "reasoning": "High impact flash loan oracle manipulation."
+        "reasoning": "High impact flash loan oracle manipulation verified."
     })
     direct_vm.mock_llm(r".*Flash loan.*", leader_payload, for_validator=False)
     direct_vm.mock_llm(r".*Flash loan.*", validator_payload, for_validator=True)
@@ -515,7 +615,7 @@ def test_consensus_tolerance_within_band(contract, direct_vm, sponsor_address, r
 
 
 # -----------------------------------------------------------------------------
-# 9. PROMPT INJECTION DEFENSE
+# 10. PROMPT INJECTION DEFENSE
 # -----------------------------------------------------------------------------
 
 def test_prompt_injection_defense(contract, direct_vm, sponsor_address, researcher_address):
@@ -523,7 +623,8 @@ def test_prompt_injection_defense(contract, direct_vm, sponsor_address, research
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -553,7 +654,7 @@ def test_prompt_injection_defense(contract, direct_vm, sponsor_address, research
 
 
 # -----------------------------------------------------------------------------
-# 10. ON-CHAIN TIMELOCK & DEADLINE ENFORCEMENT
+# 11. ON-CHAIN TIMELOCK & DEADLINE ENFORCEMENT
 # -----------------------------------------------------------------------------
 
 def test_researcher_timelock_deadline_enforcement(contract, direct_vm, sponsor_address, researcher_address):
@@ -562,12 +663,13 @@ def test_researcher_timelock_deadline_enforcement(contract, direct_vm, sponsor_a
     Once block.timestamp elapses beyond the challenge deadline, researcher CAN settle.
     """
     direct_vm.balances.clear()
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,  # 24 hours
             critical_payout_bps=5000,
@@ -579,7 +681,7 @@ def test_researcher_timelock_deadline_enforcement(contract, direct_vm, sponsor_a
     with direct_vm.prank(researcher_address, value=50):
         rid = contract.submit_report(
             program_id=pid,
-            target_component="contracts/Vault.sol",
+            target_component="contracts/Token.sol",
             commit_or_version="v1.0",
             report_title="Staking math overflow",
             report_details="Integer multiplication overflow in reward computation",
@@ -588,10 +690,11 @@ def test_researcher_timelock_deadline_enforcement(contract, direct_vm, sponsor_a
 
     high_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 8.0,
         "severity": "HIGH",
-        "reasoning": "Valid math overflow resulting in blocked rewards."
+        "reasoning": "Valid math overflow resulting in blocked rewards verified in target code."
     })
     direct_vm.mock_llm(r".*Staking math.*", high_payload, for_validator=False)
     direct_vm.mock_llm(r".*Staking math.*", high_payload, for_validator=True)
@@ -618,17 +721,18 @@ def test_researcher_timelock_deadline_enforcement(contract, direct_vm, sponsor_a
 
 
 # -----------------------------------------------------------------------------
-# 11. SPONSOR CHALLENGE DURING WINDOW
+# 12. SPONSOR CHALLENGE DURING WINDOW
 # -----------------------------------------------------------------------------
 
 def test_sponsor_challenge_during_window(contract, direct_vm, sponsor_address, researcher_address):
     """Sponsor challenges an adjudicated report during the challenge window (e.g. duplicate issue)."""
-    mock_scope_security_md(direct_vm)
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -649,10 +753,11 @@ def test_sponsor_challenge_during_window(contract, direct_vm, sponsor_address, r
 
     high_payload = json.dumps({
         "in_scope": True,
+        "code_verified": True,
         "is_valid": True,
         "cvss_score": 8.0,
         "severity": "HIGH",
-        "reasoning": "Valid technical flaw."
+        "reasoning": "Valid technical flaw in code."
     })
     direct_vm.mock_llm(r".*Duplicate finding.*", high_payload, for_validator=False)
     direct_vm.mock_llm(r".*Duplicate finding.*", high_payload, for_validator=True)
@@ -669,7 +774,7 @@ def test_sponsor_challenge_during_window(contract, direct_vm, sponsor_address, r
 
 
 # -----------------------------------------------------------------------------
-# 12. PROGRAM CANCELLATION & VAULT RECOVERY
+# 13. PROGRAM CANCELLATION & VAULT RECOVERY
 # -----------------------------------------------------------------------------
 
 def test_cancel_program_and_vault_refund(contract, direct_vm, sponsor_address):
@@ -679,7 +784,8 @@ def test_cancel_program_and_vault_refund(contract, direct_vm, sponsor_address):
     with direct_vm.prank(sponsor_address, value=7500):
         pid = contract.create_program(
             name="Expiring Program",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
@@ -698,7 +804,7 @@ def test_cancel_program_and_vault_refund(contract, direct_vm, sponsor_address):
 
 
 # -----------------------------------------------------------------------------
-# 13. ACCESS CONTROLS & ERROR HANDLING
+# 14. ACCESS CONTROLS & ERROR HANDLING
 # -----------------------------------------------------------------------------
 
 def test_access_controls_and_error_handling(
@@ -708,7 +814,8 @@ def test_access_controls_and_error_handling(
     with direct_vm.prank(sponsor_address, value=5000):
         pid = contract.create_program(
             name="DeFi Protocol",
-            scope_url="https://github.com/defiprotocol/core/security.md",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,

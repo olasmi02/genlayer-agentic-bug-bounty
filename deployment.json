@@ -1,9 +1,9 @@
 {
-  "contract_address": "0x2625F4638B0D57DfB0b7731c7Fe45269A262098D",
-  "contract_explorer_url": "https://explorer-studio.genlayer.com/contracts/0x2625F4638B0D57DfB0b7731c7Fe45269A262098D",
-  "address_explorer_url": "https://explorer-studio.genlayer.com/address/0x2625F4638B0D57DfB0b7731c7Fe45269A262098D",
-  "tx_hash": "0x91d9449aedcff5490136301c895b4432f970559dec367fd41e2cff5fd5338615",
-  "tx_explorer_url": "https://explorer-studio.genlayer.com/tx/0x91d9449aedcff5490136301c895b4432f970559dec367fd41e2cff5fd5338615",
-  "deployer": "0xDbd16cd0a8030e30bE8Cc46841480386ce079Ce1",
-  "deployed_at": "2026-10-11T08:15:49.691155+00:00"
+  "contract_address": "0x5A778C99e2c3B08dA340Ec0CA7B99327fe0dFa0b",
+  "contract_explorer_url": "https://explorer-studio.genlayer.com/contracts/0x5A778C99e2c3B08dA340Ec0CA7B99327fe0dFa0b",
+  "address_explorer_url": "https://explorer-studio.genlayer.com/address/0x5A778C99e2c3B08dA340Ec0CA7B99327fe0dFa0b",
+  "tx_hash": "0xcc1c59e3395b307fe853d85b9c53443949d7033ad6fb4061780440fc9ce45898",
+  "tx_explorer_url": "https://explorer-studio.genlayer.com/tx/0xcc1c59e3395b307fe853d85b9c53443949d7033ad6fb4061780440fc9ce45898",
+  "deployer": "0xB93C43265C71A2A86454c2f5441e7C44ff87F109",
+  "deployed_at": "2026-10-13T15:00:36.603032+00:00"
 }
