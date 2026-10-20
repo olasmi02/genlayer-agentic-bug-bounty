@@ -8,11 +8,17 @@ Key Innovations:
 - **Authoritative Target Code Acquisition**: Validators deterministically derive and fetch the referenced target source code at the specified commit/version (`code_url = {repo_base_url}/{commit}/{target_component}`) via `gl.nondet.web.get` before evaluating the vulnerability.
 - **Autonomous Scope Verification**: Non-deterministic web fetch (`gl.nondet.web.get`) cross-references target files against live project `security.md` scopes.
 - **Pure Functional Nondeterministic Flow (GenVM Compliant)**: Nondeterministic triage callbacks (`leader_fn` and `validator_fn`) are strictly pure closures capturing only local primitive arguments. No contract storage (`self`) or storage writes are reachable from the nondeterministic context.
-- **On-Chain CVSS v3.1 Triage**: Validators inspect the real source code and researcher PoC to evaluate vulnerability existence, attack vector, privileges required, and impact to compute standardized CVSS scores.
+- **Quarantined & Reserved Adjudicated Obligations**: Adjudicated payouts are immediately transferred from unreserved vault capital into a dedicated `reserved_payouts` pool, guaranteeing that subsequent reports or withdrawals cannot cause insolvency.
+- **Complete, Bounded Challenge Lifecycle**:
+  - Sponsors can challenge an adjudicated report during the challenge window.
+  - Challenges are bounded by `challenge_resolution_deadline`.
+  - Sponsors can resolve challenges via `resolve_challenge` (uphold and payout, or dismiss with bond refund or bond slashing).
+  - If the sponsor fails to resolve the challenge within the bounded window, `claim_expired_challenge` executes default settlement to prevent indefinite lockups.
+- **Insolvency Prevention for Active Reports**:
+  - `cancel_program` and `withdraw_vault` strictly enforce `program.active_reports_count == 0` and `program.reserved_payouts == 0`.
+  - Sponsors are barred from cancelling or withdrawing while any reports are submitted, adjudicated, or challenged.
 - **Equivalence Principle with Canonical Severity Bands**: Leader nodes propose evaluations, but validators strictly enforce matching canonical severity bands (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INVALID`) and bounded CVSS score tolerances ($\pm 0.8$).
-- **Deterministic Escrow Payouts**: Payouts are computed mathematically from pre-configured basis points of the active vault—eliminating leader hallucination or discretionary bias.
 - **Anti-Spam Game Theory & Slashing**: Researchers stake a refundable bond (`min_stake`). Valid bugs refund 100% of the bond with the reward; unverified code, fraudulent, or spam reports are slashed directly into the project vault.
-- **Enforced On-Chain Timelocks**: Researchers cannot claim payouts before the challenge deadline elapses (`gl.block.timestamp > challenge_deadline`), preserving sponsor review rights while guaranteeing trustless release if undisputed.
 
 ---
 
@@ -28,10 +34,10 @@ sequenceDiagram
     participant GitWeb as Authoritative Repository (GitHub / Code Host)
 
     Sponsor->>Contract: create_program(name, repo_base_url, scope_url, min_stake, payouts) + [Vault Native Value]
-    Note over Contract: Vault locked in escrow
+    Note over Contract: Vault locked in escrow (unreserved balance)
 
     Researcher->>Contract: submit_report(target_component, commit_version, title, PoC) + [Anti-Spam Stake]
-    Note over Contract: Anti-spam bond locked; excess refunded immediately
+    Note over Contract: Anti-spam bond locked; excess refunded immediately<br/>active_reports_count incremented
 
     Contract->>Validators: triage_report(report_id)
     Note over Validators: Pure functional closure executes with local primitives (No storage reachable)
@@ -42,52 +48,60 @@ sequenceDiagram
     Validators-->>Contract: Consensus Finalized (Severity, CVSS, CodeVerified, Summary)
 
     alt Report Invalid / Out-of-Scope / Code Unverified / Spam
-        Note over Contract: Deterministic State Write: Status -> REJECTED<br/>Anti-spam bond slashed into Vault
+        Note over Contract: Status -> REJECTED<br/>Anti-spam bond slashed into Vault<br/>active_reports_count decremented
     else Report Valid (LOW, MEDIUM, HIGH, CRITICAL)
-        Note over Contract: Deterministic State Write: Status -> ADJUDICATED<br/>Challenge Window Starts (block.timestamp + period)
+        Note over Contract: Status -> ADJUDICATED<br/>Obligation reserved: vault_balance -> reserved_payouts<br/>Challenge Window Starts (block.timestamp + period)
         alt Early Sponsor Settlement
             Sponsor->>Contract: settle_payout(report_id)
-            Contract-->>Researcher: Transfer [Bounty + 100% Staked Bond]
-        else Dispute / Challenge by Sponsor
+            Contract-->>Researcher: Transfer [Reserved Payout + 100% Staked Bond]
+        else Sponsor Challenge
             Sponsor->>Contract: challenge_report(report_id, reason)
-            Note over Contract: Status -> CHALLENGED
+            Note over Contract: Status -> CHALLENGED<br/>Bounded deadline: challenge_resolution_deadline set
+            alt Sponsor Resolves Challenge: Upheld
+                Sponsor->>Contract: resolve_challenge(report_id, uphold=True, slash=False)
+                Contract-->>Researcher: Transfer [Reserved Payout + 100% Staked Bond]
+            else Sponsor Resolves Challenge: Dismissed (Good-Faith Duplicate)
+                Sponsor->>Contract: resolve_challenge(report_id, uphold=False, slash=False)
+                Note over Contract: Payout unreserved back to vault<br/>Researcher bond refunded
+            else Sponsor Resolves Challenge: Dismissed (Fraudulent Claim)
+                Sponsor->>Contract: resolve_challenge(report_id, uphold=False, slash=True)
+                Note over Contract: Payout unreserved back to vault<br/>Researcher bond slashed into vault
+            else Sponsor Stalls Past Deadline
+                Note over Contract: block.timestamp > challenge_resolution_deadline
+                Researcher->>Contract: claim_expired_challenge(report_id)
+                Contract-->>Researcher: Default Settlement [Reserved Payout + 100% Staked Bond]
+            end
         else Uncontested Claim after Timelock
             Note over Contract: block.timestamp > challenge_deadline
             Researcher->>Contract: settle_payout(report_id)
-            Contract-->>Researcher: Transfer [Bounty + 100% Staked Bond]
+            Contract-->>Researcher: Transfer [Reserved Payout + 100% Staked Bond]
         end
     end
 ```
 
 ---
 
-## 3. Consensus Architecture & Equivalence Principle
+## 3. Escrow Lifecycle & Insolvency Prevention
 
-GenLayer's Non-Deterministic Consensus guarantees that subjective and web-dependent data yields deterministic execution state across validators.
+### Complete Escrow Invariants
+The contract maintains exact double-entry native token accounting:
+$$\text{total\_vault\_locked} = \sum (\text{program.vault\_balance} + \text{program.reserved\_payouts})$$
+$$\text{total\_bonds\_locked} = \sum \text{report.staked\_bond}$$
 
-### GenVM Lint Compliant Execution Model
+1. **Quarantined Adjudicated Obligations**:
+   When a report is adjudicated, the computed payout is immediately deducted from `program.vault_balance` and placed in `program.reserved_payouts`.
+   Subsequent reports can only calculate payouts against the remaining unreserved `vault_balance`. Thus, earlier claims can never be diluted or made insolvent.
 
-1. **Pure Closure Design**:
-   All state variables (`repo_base_url`, `scope_url`, `target_component`, `commit_or_version`, `title`, `details`, `claimed_severity`) are extracted into local strings inside `triage_report()` prior to invoking `gl.vm.run_nondet_unsafe`.
-   The `leader_fn` and `validator_fn` closures reference only these primitives and call pure top-level helper functions. No `self` reference exists within the callbacks, preventing any storage writes or reads from the nondeterministic triage context.
+2. **Insolvency Prevention during Cancellations and Withdrawals**:
+   `cancel_program` and `withdraw_vault` verify that:
+   $$\text{program.active\_reports\_count} == 0 \quad \land \quad \text{program.reserved\_payouts} == 0$$
+   A sponsor cannot drain or cancel a vault while any submitted, adjudicated, or challenged report is pending.
 
-2. **Authoritative Code Acquisition**:
-   - `code_url = f"{repo_base_url.rstrip('/')}/{commit_or_version.strip()}/{target_component.strip().lstrip('/')}"`
-   - If the code cannot be fetched (HTTP != 200), `code_verified` is marked `False`, causing the report to be rejected as `INVALID`.
-   - The LLM receives the real source code at that specific commit and verifies whether the vulnerability genuinely exists.
-
-3. **Validator Equivalence Check (`perform_validator_triage`)**:
-   - Validator independently fetches the authoritative scope and target source code.
-   - **Equivalence Rule Set**:
-     $$\text{Equivalence} = \begin{cases}
-     \text{True} & \text{if } \text{in\_scope}_V == \text{in\_scope}_L \\
-                 & \land \; \text{code\_verified}_V == \text{code\_verified}_L \\
-                 & \land \; \text{is\_valid}_V == \text{is\_valid}_L \\
-                 & \land \; \text{severity}_V == \text{severity}_L \\
-                 & \land \; |\text{cvss\_x10}_V - \text{cvss\_x10}_L| \le 8 \\
-     \text{False} & \text{otherwise}
-     \end{cases}$$
-   - If validator disagrees on canonical severity or code verification, consensus rejects the leader proposal immediately.
+3. **Bounded Challenge Lifecycle**:
+   Every challenge is bounded by `challenge_resolution_deadline = gl.block.timestamp + challenge_period`.
+   - If the sponsor acts, they can uphold the report (settling payout and bond) or dismiss it (unreserving the payout and choosing whether to refund or slash the bond based on good faith).
+   - If the sponsor fails to resolve the challenge before the deadline, any caller (e.g. the researcher) can trigger `claim_expired_challenge`, releasing the reserved payout and bond by default.
+   - Payouts and researcher bonds can **never** remain locked permanently.
 
 ---
 
@@ -99,20 +113,4 @@ GenLayer's Non-Deterministic Consensus guarantees that subjective and web-depend
 | **HIGH** | $7.0 - 8.9$ | Temporary freezing of funds, unauthorized admin privilege in target code. | 2,000 bps (20%) |
 | **MEDIUM** | $4.0 - 6.9$ | Gas exhaustion under specific states, logic flaws without direct theft in target code. | 800 bps (8%) |
 | **LOW** | $0.1 - 3.9$ | Informational finding, rounding error with negligible impact in target code. | 200 bps (2%) |
-| **INVALID** | $0.0$ | Bug does not exist in target code, code unverified, out of scope, or prompt injection. | 0 bps (Bond Slashed) |
-
----
-
-## 5. Security Model & Adversarial Defenses
-
-1. **Authoritative Code Verification**:
-   - Narratives without matching vulnerable logic in the acquired target code are automatically marked `INVALID`.
-2. **Prompt Injection Mitigation**:
-   - Pre-validation regex filter (`PROMPT_INJECTION_PATTERNS`) rejects known jailbreak phrases at submission time.
-   - LLM prompt wraps user PoC in `<untrusted_researcher_poc>` tags with explicit defensive system directives.
-3. **Deterministic Mathematical Settlements**:
-   - Payout calculations are derived strictly from contract state: $\text{payout} = (\text{vault\_balance} \times \text{bps}) / 10000$.
-4. **Exact Native Escrow & Zero Capital Trap**:
-   - All excess native value sent beyond required deposits/stakes is calculated and refunded back to `gl.message.sender_address` via `emit_transfer`.
-5. **On-Chain Timelock Defense**:
-   - Researchers are strictly prohibited from calling `settle_payout` before `gl.block.timestamp > challenge_deadline`.
+| **INVALID** | $0.0$ | Bug does not exist in code, code unverified (404), out of scope, or prompt injection. | 0 bps (Bond Slashed) |

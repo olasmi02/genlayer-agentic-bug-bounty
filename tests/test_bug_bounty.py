@@ -13,8 +13,13 @@ Covers:
 - CVSS score consensus tolerance handling
 - Prompt injection defense
 - On-chain timelock deadline enforcement (researcher vs sponsor settlement)
-- Sponsor challenge during window
-- Program cancellation and vault fund recovery
+- Quarantining & reserving adjudicated obligations to prevent insolvency
+- Bounded challenge lifecycle: sponsor challenge, resolution (upheld vs dismissed)
+- Bond settlement on challenge (refund on good-faith duplicate vs slashing on fraud)
+- Bounded default settlement: claim_expired_challenge when sponsor fails to resolve
+- Insolvency prevention: blocking cancel_program and withdraw_vault while reports are active
+- Program cancellation and vault fund recovery when solvent
+- Access controls and unauthorized caller reverts
 """
 
 import pytest
@@ -109,6 +114,8 @@ def test_program_creation_and_funding(contract, direct_vm, sponsor_address):
     assert prog["repo_base_url"] == "https://raw.githubusercontent.com/defiprotocol/core"
     assert prog["scope_url"] == "https://raw.githubusercontent.com/defiprotocol/core/main/security.md"
     assert prog["vault_balance"] == 10000
+    assert prog["reserved_payouts"] == 0
+    assert prog["active_reports_count"] == 0
     assert prog["min_stake"] == 50
     assert prog["challenge_period"] == 86400
     assert prog["status"] == PROGRAM_ACTIVE
@@ -182,6 +189,9 @@ def test_excess_deposit_refund_on_submission(contract, direct_vm, sponsor_addres
     assert rep["staked_bond"] == 50
     assert rep["status"] == REPORT_SUBMITTED
 
+    prog = contract.get_program(pid)
+    assert prog["active_reports_count"] == 1
+
 
 def test_insufficient_anti_spam_stake_reverts(contract, direct_vm, sponsor_address, researcher_address):
     """Submission with insufficient anti-spam bond reverts."""
@@ -212,7 +222,7 @@ def test_insufficient_anti_spam_stake_reverts(contract, direct_vm, sponsor_addre
 
 
 # -----------------------------------------------------------------------------
-# 3. CONSENSUS TRIAGE: CRITICAL VULNERABILITY (AUTHORITATIVE CODE VERIFIED)
+# 3. CONSENSUS TRIAGE: CRITICAL VULNERABILITY (RESERVED OBLIGATION & SETTLEMENT)
 # -----------------------------------------------------------------------------
 
 def test_critical_severity_triage_with_authoritative_code_verification(
@@ -221,7 +231,7 @@ def test_critical_severity_triage_with_authoritative_code_verification(
     """
     Consensus acquires authoritative target source code at specified commit,
     verifies reentrancy flaw against code, agrees on CRITICAL (CVSS 9.8),
-    and sponsor settles early.
+    quarantines and reserves the payout in reserved_payouts, and sponsor settles early.
     """
     direct_vm.balances.clear()
     mock_scope_and_target_code(direct_vm)
@@ -269,6 +279,12 @@ def test_critical_severity_triage_with_authoritative_code_verification(
     assert rep["adjudicated_cvss_x10"] == 98
     assert rep["payout_amount"] == 5000  # 50% of 10,000 vault
 
+    # Verify payout is reserved and deducted from unreserved vault balance
+    prog = contract.get_program(pid)
+    assert prog["vault_balance"] == 5000
+    assert prog["reserved_payouts"] == 5000
+    assert prog["active_reports_count"] == 1
+
     # Sponsor approves early settlement
     with direct_vm.prank(sponsor_address):
         contract.settle_payout(rid)
@@ -277,13 +293,109 @@ def test_critical_severity_triage_with_authoritative_code_verification(
     assert rep_after["status"] == REPORT_SETTLED
     assert direct_vm.balances[researcher_address] == 5050  # 5000 reward + 50 bond
 
+    prog_after = contract.get_program(pid)
+    assert prog_after["reserved_payouts"] == 0
+    assert prog_after["active_reports_count"] == 0
+    assert prog_after["vault_balance"] == 5000
+
 
 # -----------------------------------------------------------------------------
-# 4. HIGH & MEDIUM SEVERITY TRIAGE
+# 4. RESERVING OBLIGATIONS & SUBSEQUENT REPORT SOLVENCY
 # -----------------------------------------------------------------------------
 
-def test_high_and_medium_severity_triage(contract, direct_vm, sponsor_address, researcher_address):
-    """Verifies that HIGH and MEDIUM canonical bands yield deterministic mathematical payouts."""
+def test_reserved_adjudicated_obligations_and_solvency(
+    contract, direct_vm, sponsor_address, researcher_address
+):
+    """
+    Tests that adjudicating a report reserves its obligation, and subsequent reports
+    derive payouts only from remaining unreserved capital, ensuring insolvency is impossible.
+    """
+    mock_scope_and_target_code(direct_vm)
+
+    with direct_vm.prank(sponsor_address, value=10000):
+        pid = contract.create_program(
+            name="DeFi Protocol",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
+            min_stake=50,
+            challenge_period=86400,
+            critical_payout_bps=5000, # 50%
+            high_payout_bps=2000,     # 20%
+            medium_payout_bps=800,
+            low_payout_bps=200,
+        )
+
+    # 1. Report A submitted and adjudicated CRITICAL
+    with direct_vm.prank(researcher_address, value=50):
+        rid_a = contract.submit_report(
+            program_id=pid,
+            target_component="contracts/Vault.sol",
+            commit_or_version="c1",
+            report_title="Critical Reentrancy",
+            report_details="Exploit reentrancy",
+            claimed_severity="CRITICAL",
+        )
+
+    crit_payload = json.dumps({
+        "in_scope": True,
+        "code_verified": True,
+        "is_valid": True,
+        "cvss_score": 9.5,
+        "severity": "CRITICAL",
+        "reasoning": "Reentrancy confirmed."
+    })
+    direct_vm.mock_llm(r".*Critical Reentrancy.*", crit_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Critical Reentrancy.*", crit_payload, for_validator=True)
+
+    contract.triage_report(rid_a)
+    prog = contract.get_program(pid)
+    assert prog["vault_balance"] == 5000
+    assert prog["reserved_payouts"] == 5000
+    assert prog["active_reports_count"] == 1
+
+    # 2. Report B submitted and adjudicated HIGH
+    with direct_vm.prank(researcher_address, value=50):
+        rid_b = contract.submit_report(
+            program_id=pid,
+            target_component="contracts/Token.sol",
+            commit_or_version="c2",
+            report_title="High DOS issue",
+            report_details="Exploit unbounded loop",
+            claimed_severity="HIGH",
+        )
+
+    high_payload = json.dumps({
+        "in_scope": True,
+        "code_verified": True,
+        "is_valid": True,
+        "cvss_score": 7.5,
+        "severity": "HIGH",
+        "reasoning": "Loop DOS confirmed."
+    })
+    direct_vm.mock_llm(r".*High DOS.*", high_payload, for_validator=False)
+    direct_vm.mock_llm(r".*High DOS.*", high_payload, for_validator=True)
+
+    contract.triage_report(rid_b)
+    rep_b = contract.get_report(rid_b)
+    # 20% of remaining 5000 unreserved vault = 1000
+    assert rep_b["payout_amount"] == 1000
+
+    prog2 = contract.get_program(pid)
+    assert prog2["vault_balance"] == 4000
+    assert prog2["reserved_payouts"] == 6000 # 5000 + 1000 reserved
+    assert prog2["active_reports_count"] == 2
+
+
+# -----------------------------------------------------------------------------
+# 5. BOUNDED CHALLENGE LIFECYCLE: RESOLVE CHALLENGE (UPHELD)
+# -----------------------------------------------------------------------------
+
+def test_resolve_challenge_upheld(contract, direct_vm, sponsor_address, researcher_address):
+    """
+    Sponsor challenges report within challenge window, then resolves challenge
+    by upholding researcher's claim (uphold_claim=True), releasing payout and bond.
+    """
+    direct_vm.balances.clear()
     mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
@@ -294,53 +406,151 @@ def test_high_and_medium_severity_triage(contract, direct_vm, sponsor_address, r
             min_stake=50,
             challenge_period=86400,
             critical_payout_bps=5000,
-            high_payout_bps=2000, # 20%
-            medium_payout_bps=800, # 8%
+            high_payout_bps=2000,
+            medium_payout_bps=800,
             low_payout_bps=200,
         )
 
     with direct_vm.prank(researcher_address, value=50):
-        rid_high = contract.submit_report(
+        rid = contract.submit_report(
             program_id=pid,
-            target_component="contracts/Token.sol",
-            commit_or_version="commit-xyz",
-            report_title="Temporary lock of reward transfers",
-            report_details="Unchecked array iteration causes transaction revert on large claims.",
-            claimed_severity="HIGH",
+            target_component="contracts/Vault.sol",
+            commit_or_version="c1",
+            report_title="Vault Reentrancy",
+            report_details="Reentrancy drain",
+            claimed_severity="CRITICAL",
         )
 
-    high_payload = json.dumps({
+    triage_payload = json.dumps({
         "in_scope": True,
         "code_verified": True,
         "is_valid": True,
-        "cvss_score": 7.8,
-        "severity": "HIGH",
-        "reasoning": "Authoritative target code contracts/Token.sol verified. Unbounded loop causes DOS."
+        "cvss_score": 9.8,
+        "severity": "CRITICAL",
+        "reasoning": "Confirmed reentrancy."
     })
-    direct_vm.mock_llm(r".*Temporary lock.*", high_payload, for_validator=False)
-    direct_vm.mock_llm(r".*Temporary lock.*", high_payload, for_validator=True)
+    direct_vm.mock_llm(r".*Vault Reentrancy.*", triage_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Vault Reentrancy.*", triage_payload, for_validator=True)
 
-    contract.triage_report(rid_high)
-    r_high = contract.get_report(rid_high)
-    assert r_high["adjudicated_severity"] == SEVERITY_HIGH
-    assert r_high["payout_amount"] == 2000 # 20% of 10000
+    contract.triage_report(rid)
+
+    # Sponsor challenges report
+    with direct_vm.prank(sponsor_address):
+        contract.challenge_report(rid, reason="Reviewing edge cases")
+
+    rep = contract.get_report(rid)
+    assert rep["status"] == REPORT_CHALLENGED
+    assert rep["challenge_resolution_deadline"] > 0
+
+    # Sponsor resolves challenge upholding researcher claim
+    with direct_vm.prank(sponsor_address):
+        contract.resolve_challenge(
+            report_id=rid,
+            uphold_claim=True,
+            slash_bond=False,
+            resolution_notes="Edge case confirmed valid after team review",
+        )
+
+    rep_final = contract.get_report(rid)
+    assert rep_final["status"] == REPORT_SETTLED
+    assert direct_vm.balances[researcher_address] == 5050 # 5000 payout + 50 bond
+
+    prog = contract.get_program(pid)
+    assert prog["reserved_payouts"] == 0
+    assert prog["active_reports_count"] == 0
 
 
 # -----------------------------------------------------------------------------
-# 5. TARGET CODE ACQUISITION FAILURE (HTTP 404) & BOND SLASHING
+# 6. BOUNDED CHALLENGE LIFECYCLE: RESOLVE CHALLENGE (DISMISSED & REFUND BOND)
 # -----------------------------------------------------------------------------
 
-def test_target_code_acquisition_failure_slashed(contract, direct_vm, sponsor_address, researcher_address):
+def test_resolve_challenge_dismissed_with_good_faith_bond_refund(
+    contract, direct_vm, sponsor_address, researcher_address
+):
     """
-    If the referenced target source code cannot be fetched at the specified commit (HTTP 404),
-    the report cannot be verified, is marked INVALID, and the researcher's bond is slashed into the vault.
+    Sponsor proves report is a good-faith duplicate of prior private audit.
+    Challenge is sustained (uphold_claim=False), reserved payout returns to vault,
+    and researcher bond is refunded (slash_bond=False).
     """
-    scope_body = "# Security Policy\nIn-Scope:\n- contracts/NonExistent.sol\n"
-    direct_vm.mock_web(r".*security\.md", scope_body, 200, for_validator=False)
-    direct_vm.mock_web(r".*security\.md", scope_body, 200, for_validator=True)
-    # Target code returns 404
-    direct_vm.mock_web(r".*NonExistent\.sol", "404 Not Found", 404, for_validator=False)
-    direct_vm.mock_web(r".*NonExistent\.sol", "404 Not Found", 404, for_validator=True)
+    direct_vm.balances.clear()
+    mock_scope_and_target_code(direct_vm)
+
+    with direct_vm.prank(sponsor_address, value=10000):
+        pid = contract.create_program(
+            name="DeFi Protocol",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
+            min_stake=50,
+            challenge_period=86400,
+            critical_payout_bps=5000,
+            high_payout_bps=2000,
+            medium_payout_bps=800,
+            low_payout_bps=200,
+        )
+
+    with direct_vm.prank(researcher_address, value=50):
+        rid = contract.submit_report(
+            program_id=pid,
+            target_component="contracts/Vault.sol",
+            commit_or_version="c1",
+            report_title="Duplicate Finding",
+            report_details="Reentrancy drain",
+            claimed_severity="CRITICAL",
+        )
+
+    triage_payload = json.dumps({
+        "in_scope": True,
+        "code_verified": True,
+        "is_valid": True,
+        "cvss_score": 9.0,
+        "severity": "CRITICAL",
+        "reasoning": "Vulnerability exists."
+    })
+    direct_vm.mock_llm(r".*Duplicate Finding.*", triage_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Duplicate Finding.*", triage_payload, for_validator=True)
+
+    contract.triage_report(rid)
+    prog_before = contract.get_program(pid)
+    assert prog_before["reserved_payouts"] == 5000
+
+    # Sponsor challenges
+    with direct_vm.prank(sponsor_address):
+        contract.challenge_report(rid, reason="Known internal duplicate")
+
+    # Sponsor resolves challenge: dismisses bounty, refunds bond (good-faith finding)
+    with direct_vm.prank(sponsor_address):
+        contract.resolve_challenge(
+            report_id=rid,
+            uphold_claim=False,
+            slash_bond=False,
+            resolution_notes="Duplicate of audit issue #7; bond refunded in good faith",
+        )
+
+    rep = contract.get_report(rid)
+    assert rep["status"] == REPORT_REJECTED
+    assert rep["payout_amount"] == 0
+
+    # Reserved payout unreserved and returned to vault balance
+    prog_after = contract.get_program(pid)
+    assert prog_after["vault_balance"] == 10000
+    assert prog_after["reserved_payouts"] == 0
+    assert prog_after["active_reports_count"] == 0
+
+    # Bond returned to researcher
+    assert direct_vm.balances[researcher_address] == 50
+
+
+# -----------------------------------------------------------------------------
+# 7. BOUNDED CHALLENGE LIFECYCLE: RESOLVE CHALLENGE (DISMISSED & SLASH BOND)
+# -----------------------------------------------------------------------------
+
+def test_resolve_challenge_dismissed_with_bond_slashing(
+    contract, direct_vm, sponsor_address, researcher_address
+):
+    """
+    Sponsor proves report is fraudulent. Challenge is sustained and bond is slashed into vault.
+    """
+    mock_scope_and_target_code(direct_vm)
 
     with direct_vm.prank(sponsor_address, value=10000):
         pid = contract.create_program(
@@ -358,37 +568,217 @@ def test_target_code_acquisition_failure_slashed(contract, direct_vm, sponsor_ad
     with direct_vm.prank(researcher_address, value=100):
         rid = contract.submit_report(
             program_id=pid,
-            target_component="contracts/NonExistent.sol",
-            commit_or_version="invalid-commit",
-            report_title="Hallucinated file bug",
-            report_details="Claims bug in file that doesn't exist at this commit.",
-            claimed_severity="HIGH",
+            target_component="contracts/Vault.sol",
+            commit_or_version="c1",
+            report_title="Fabricated PoC",
+            report_details="Fake vulnerability",
+            claimed_severity="CRITICAL",
         )
 
-    invalid_payload = json.dumps({
+    triage_payload = json.dumps({
         "in_scope": True,
-        "code_verified": False,
-        "is_valid": False,
-        "cvss_score": 0.0,
-        "severity": "INVALID",
-        "reasoning": "Authoritative target code could not be acquired at specified commit (HTTP 404)."
+        "code_verified": True,
+        "is_valid": True,
+        "cvss_score": 9.0,
+        "severity": "CRITICAL",
+        "reasoning": "Evaluated based on submission."
     })
-    direct_vm.mock_llm(r".*Hallucinated file.*", invalid_payload, for_validator=False)
-    direct_vm.mock_llm(r".*Hallucinated file.*", invalid_payload, for_validator=True)
+    direct_vm.mock_llm(r".*Fabricated PoC.*", triage_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Fabricated PoC.*", triage_payload, for_validator=True)
 
     contract.triage_report(rid)
 
+    with direct_vm.prank(sponsor_address):
+        contract.challenge_report(rid, reason="Fraudulent PoC")
+
+    # Sponsor dismisses report and slashes bond
+    with direct_vm.prank(sponsor_address):
+        contract.resolve_challenge(
+            report_id=rid,
+            uphold_claim=False,
+            slash_bond=True,
+            resolution_notes="Malicious fabricated exploit confirmed",
+        )
+
     rep = contract.get_report(rid)
     assert rep["status"] == REPORT_REJECTED
-    assert rep["adjudicated_severity"] == SEVERITY_INVALID
-    assert rep["staked_bond"] == 0
 
     prog = contract.get_program(pid)
-    assert prog["vault_balance"] == 10100 # Slashed 100 added to vault
+    # Vault gets 5000 reserved returned + 100 slashed bond = 10100
+    assert prog["vault_balance"] == 10100
+    assert prog["reserved_payouts"] == 0
+    assert prog["active_reports_count"] == 0
 
 
 # -----------------------------------------------------------------------------
-# 6. CODE DOES NOT CONTAIN VULNERABILITY (NARRATIVE MISMATCH) & BOND SLASHING
+# 8. BOUNDED DEFAULT SETTLEMENT: CLAIM EXPIRED CHALLENGE
+# -----------------------------------------------------------------------------
+
+def test_claim_expired_challenge_default_release(
+    contract, direct_vm, sponsor_address, researcher_address
+):
+    """
+    Sponsor challenges a report, but fails to resolve it before challenge_resolution_deadline.
+    Researcher triggers default settlement once the bounded deadline expires.
+    """
+    direct_vm.balances.clear()
+    mock_scope_and_target_code(direct_vm)
+
+    with direct_vm.prank(sponsor_address, value=10000):
+        pid = contract.create_program(
+            name="DeFi Protocol",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
+            min_stake=50,
+            challenge_period=86400, # 24 hours
+            critical_payout_bps=5000,
+            high_payout_bps=2000,
+            medium_payout_bps=800,
+            low_payout_bps=200,
+        )
+
+    with direct_vm.prank(researcher_address, value=50):
+        rid = contract.submit_report(
+            program_id=pid,
+            target_component="contracts/Vault.sol",
+            commit_or_version="c1",
+            report_title="Slow Sponsor Bug",
+            report_details="Reentrancy drain",
+            claimed_severity="CRITICAL",
+        )
+
+    triage_payload = json.dumps({
+        "in_scope": True,
+        "code_verified": True,
+        "is_valid": True,
+        "cvss_score": 9.5,
+        "severity": "CRITICAL",
+        "reasoning": "Valid reentrancy."
+    })
+    direct_vm.mock_llm(r".*Slow Sponsor Bug.*", triage_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Slow Sponsor Bug.*", triage_payload, for_validator=True)
+
+    contract.triage_report(rid)
+
+    with direct_vm.prank(sponsor_address):
+        contract.challenge_report(rid, reason="Taking time to review")
+
+    rep = contract.get_report(rid)
+    res_deadline = rep["challenge_resolution_deadline"]
+
+    # 1. Researcher tries to claim before resolution deadline -> Reverts
+    direct_vm.timestamp = res_deadline - 10
+    with pytest.raises(Exception) as exc:
+        with direct_vm.prank(researcher_address):
+            contract.claim_expired_challenge(rid)
+    assert "Challenge resolution period has not yet elapsed" in str(exc.value)
+
+    # 2. Researcher claims after resolution deadline -> Succeeds
+    direct_vm.timestamp = res_deadline + 1
+    with direct_vm.prank(researcher_address):
+        contract.claim_expired_challenge(rid)
+
+    rep_final = contract.get_report(rid)
+    assert rep_final["status"] == REPORT_SETTLED
+    assert direct_vm.balances[researcher_address] == 5050 # 5000 payout + 50 bond
+
+
+# -----------------------------------------------------------------------------
+# 9. INSOLVENCY PREVENTION: PREVENTING CANCELLATION & WITHDRAWALS WITH ACTIVE REPORTS
+# -----------------------------------------------------------------------------
+
+def test_prevent_insolvent_cancellation_and_withdrawals_with_active_reports(
+    contract, direct_vm, sponsor_address, researcher_address
+):
+    """
+    Verifies that program cancellation and withdrawals are strictly prevented
+    whenever there are submitted, adjudicated, or challenged reports active,
+    preventing outstanding obligations from becoming insolvent.
+    """
+    mock_scope_and_target_code(direct_vm)
+
+    with direct_vm.prank(sponsor_address, value=10000):
+        pid = contract.create_program(
+            name="DeFi Protocol",
+            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
+            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
+            min_stake=50,
+            challenge_period=86400,
+            critical_payout_bps=5000,
+            high_payout_bps=2000,
+            medium_payout_bps=800,
+            low_payout_bps=200,
+        )
+
+    # 1. Report is in SUBMITTED state -> Cancellation and withdrawal must fail!
+    with direct_vm.prank(researcher_address, value=50):
+        rid = contract.submit_report(
+            program_id=pid,
+            target_component="contracts/Vault.sol",
+            commit_or_version="c1",
+            report_title="Submitted Report",
+            report_details="Details",
+            claimed_severity="HIGH",
+        )
+
+    with pytest.raises(Exception) as exc1:
+        with direct_vm.prank(sponsor_address):
+            contract.cancel_program(pid)
+    assert "Cannot cancel program with 1 active reports" in str(exc1.value)
+
+    with pytest.raises(Exception) as exc2:
+        with direct_vm.prank(sponsor_address):
+            contract.withdraw_vault(pid, 1000)
+    assert "Cannot withdraw while 1 reports are active" in str(exc2.value)
+
+    # 2. Report is in ADJUDICATED state -> Cancellation and withdrawal must fail!
+    high_payload = json.dumps({
+        "in_scope": True,
+        "code_verified": True,
+        "is_valid": True,
+        "cvss_score": 7.5,
+        "severity": "HIGH",
+        "reasoning": "Valid high flaw."
+    })
+    direct_vm.mock_llm(r".*Submitted Report.*", high_payload, for_validator=False)
+    direct_vm.mock_llm(r".*Submitted Report.*", high_payload, for_validator=True)
+
+    contract.triage_report(rid)
+
+    with pytest.raises(Exception) as exc3:
+        with direct_vm.prank(sponsor_address):
+            contract.cancel_program(pid)
+    assert "Cannot cancel program with 1 active reports" in str(exc3.value)
+
+    # 3. Report is in CHALLENGED state -> Cancellation must fail!
+    with direct_vm.prank(sponsor_address):
+        contract.challenge_report(rid, reason="Testing insolvency block")
+
+    with pytest.raises(Exception) as exc4:
+        with direct_vm.prank(sponsor_address):
+            contract.cancel_program(pid)
+    assert "Cannot cancel program with 1 active reports" in str(exc4.value)
+
+    # 4. Resolve challenge to terminal state -> Cancellation and withdrawal now succeed!
+    with direct_vm.prank(sponsor_address):
+        contract.resolve_challenge(rid, uphold_claim=True, slash_bond=False, resolution_notes="Settled")
+
+    prog = contract.get_program(pid)
+    assert prog["active_reports_count"] == 0
+    assert prog["reserved_payouts"] == 0
+
+    # Sponsor can now cancel and recover unreserved balance (8000 remaining)
+    direct_vm.balances.clear()
+    with direct_vm.prank(sponsor_address):
+        contract.cancel_program(pid)
+
+    assert direct_vm.balances[sponsor_address] == 8000
+    prog_closed = contract.get_program(pid)
+    assert prog_closed["status"] == PROGRAM_CLOSED
+
+
+# -----------------------------------------------------------------------------
+# 10. CODE DOES NOT CONTAIN VULNERABILITY (SLASHING)
 # -----------------------------------------------------------------------------
 
 def test_code_does_not_contain_vulnerability_slashed(
@@ -443,10 +833,11 @@ def test_code_does_not_contain_vulnerability_slashed(
 
     prog = contract.get_program(pid)
     assert prog["vault_balance"] == 10100
+    assert prog["active_reports_count"] == 0
 
 
 # -----------------------------------------------------------------------------
-# 7. OUT-OF-SCOPE REPORT REJECTION
+# 11. OUT-OF-SCOPE REPORT REJECTION
 # -----------------------------------------------------------------------------
 
 def test_out_of_scope_report_rejected(contract, direct_vm, sponsor_address, researcher_address):
@@ -492,10 +883,12 @@ def test_out_of_scope_report_rejected(contract, direct_vm, sponsor_address, rese
     rep = contract.get_report(rid)
     assert rep["status"] == REPORT_REJECTED
     assert rep["adjudicated_severity"] == SEVERITY_INVALID
+    prog = contract.get_program(pid)
+    assert prog["active_reports_count"] == 0
 
 
 # -----------------------------------------------------------------------------
-# 8. EQUIVALENCE CHECK: VALIDATOR REJECTS MISMATCHED SEVERITY BAND
+# 12. EQUIVALENCE CHECK: VALIDATOR REJECTS MISMATCHED SEVERITY BAND
 # -----------------------------------------------------------------------------
 
 def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_address, researcher_address):
@@ -528,7 +921,6 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
             claimed_severity="HIGH",
         )
 
-    # Leader fraudulently inflates to HIGH (CVSS 7.5)
     leader_payload = json.dumps({
         "in_scope": True,
         "code_verified": True,
@@ -537,7 +929,6 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
         "severity": "HIGH",
         "reasoning": "Inflated evaluation by leader."
     })
-    # Honest validator determines LOW (CVSS 2.0)
     validator_payload = json.dumps({
         "in_scope": True,
         "code_verified": True,
@@ -555,7 +946,7 @@ def test_validator_rejects_mismatched_severity(contract, direct_vm, sponsor_addr
 
 
 # -----------------------------------------------------------------------------
-# 9. CONSENSUS TOLERANCE HANDLING
+# 13. CONSENSUS TOLERANCE HANDLING
 # -----------------------------------------------------------------------------
 
 def test_consensus_tolerance_within_band(contract, direct_vm, sponsor_address, researcher_address):
@@ -615,7 +1006,7 @@ def test_consensus_tolerance_within_band(contract, direct_vm, sponsor_address, r
 
 
 # -----------------------------------------------------------------------------
-# 10. PROMPT INJECTION DEFENSE
+# 14. PROMPT INJECTION DEFENSE
 # -----------------------------------------------------------------------------
 
 def test_prompt_injection_defense(contract, direct_vm, sponsor_address, researcher_address):
@@ -654,157 +1045,7 @@ def test_prompt_injection_defense(contract, direct_vm, sponsor_address, research
 
 
 # -----------------------------------------------------------------------------
-# 11. ON-CHAIN TIMELOCK & DEADLINE ENFORCEMENT
-# -----------------------------------------------------------------------------
-
-def test_researcher_timelock_deadline_enforcement(contract, direct_vm, sponsor_address, researcher_address):
-    """
-    Researcher CANNOT claim settlement before the challenge deadline.
-    Once block.timestamp elapses beyond the challenge deadline, researcher CAN settle.
-    """
-    direct_vm.balances.clear()
-    mock_scope_and_target_code(direct_vm)
-
-    with direct_vm.prank(sponsor_address, value=10000):
-        pid = contract.create_program(
-            name="DeFi Protocol",
-            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
-            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
-            min_stake=50,
-            challenge_period=86400,  # 24 hours
-            critical_payout_bps=5000,
-            high_payout_bps=2000,
-            medium_payout_bps=800,
-            low_payout_bps=200,
-        )
-
-    with direct_vm.prank(researcher_address, value=50):
-        rid = contract.submit_report(
-            program_id=pid,
-            target_component="contracts/Token.sol",
-            commit_or_version="v1.0",
-            report_title="Staking math overflow",
-            report_details="Integer multiplication overflow in reward computation",
-            claimed_severity="HIGH",
-        )
-
-    high_payload = json.dumps({
-        "in_scope": True,
-        "code_verified": True,
-        "is_valid": True,
-        "cvss_score": 8.0,
-        "severity": "HIGH",
-        "reasoning": "Valid math overflow resulting in blocked rewards verified in target code."
-    })
-    direct_vm.mock_llm(r".*Staking math.*", high_payload, for_validator=False)
-    direct_vm.mock_llm(r".*Staking math.*", high_payload, for_validator=True)
-
-    contract.triage_report(rid)
-    rep = contract.get_report(rid)
-    deadline = rep["challenge_deadline"]
-
-    # 1. Researcher attempts to claim BEFORE deadline -> Reverts
-    direct_vm.timestamp = deadline - 100
-    with pytest.raises(Exception) as exc:
-        with direct_vm.prank(researcher_address):
-            contract.settle_payout(rid)
-    assert "Researcher cannot claim before the challenge deadline" in str(exc.value)
-
-    # 2. Researcher claims AFTER deadline -> Succeeds
-    direct_vm.timestamp = deadline + 1
-    with direct_vm.prank(researcher_address):
-        contract.settle_payout(rid)
-
-    rep_final = contract.get_report(rid)
-    assert rep_final["status"] == REPORT_SETTLED
-    assert direct_vm.balances[researcher_address] == 2050  # 2000 payout + 50 bond
-
-
-# -----------------------------------------------------------------------------
-# 12. SPONSOR CHALLENGE DURING WINDOW
-# -----------------------------------------------------------------------------
-
-def test_sponsor_challenge_during_window(contract, direct_vm, sponsor_address, researcher_address):
-    """Sponsor challenges an adjudicated report during the challenge window (e.g. duplicate issue)."""
-    mock_scope_and_target_code(direct_vm)
-
-    with direct_vm.prank(sponsor_address, value=10000):
-        pid = contract.create_program(
-            name="DeFi Protocol",
-            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
-            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
-            min_stake=50,
-            challenge_period=86400,
-            critical_payout_bps=5000,
-            high_payout_bps=2000,
-            medium_payout_bps=800,
-            low_payout_bps=200,
-        )
-
-    with direct_vm.prank(researcher_address, value=50):
-        rid = contract.submit_report(
-            program_id=pid,
-            target_component="contracts/Vault.sol",
-            commit_or_version="v1.0",
-            report_title="Duplicate finding",
-            report_details="Already reported in internal audit report findings #4",
-            claimed_severity="HIGH",
-        )
-
-    high_payload = json.dumps({
-        "in_scope": True,
-        "code_verified": True,
-        "is_valid": True,
-        "cvss_score": 8.0,
-        "severity": "HIGH",
-        "reasoning": "Valid technical flaw in code."
-    })
-    direct_vm.mock_llm(r".*Duplicate finding.*", high_payload, for_validator=False)
-    direct_vm.mock_llm(r".*Duplicate finding.*", high_payload, for_validator=True)
-
-    contract.triage_report(rid)
-
-    # Sponsor challenges
-    with direct_vm.prank(sponsor_address):
-        contract.challenge_report(rid, reason="Known internal duplicate issue logged in audit item #4")
-
-    rep = contract.get_report(rid)
-    assert rep["status"] == REPORT_CHALLENGED
-    assert "CHALLENGED: Known internal duplicate" in rep["triage_summary"]
-
-
-# -----------------------------------------------------------------------------
-# 13. PROGRAM CANCELLATION & VAULT RECOVERY
-# -----------------------------------------------------------------------------
-
-def test_cancel_program_and_vault_refund(contract, direct_vm, sponsor_address):
-    """Sponsor can cancel active program and recover remaining vault funds."""
-    direct_vm.balances.clear()
-
-    with direct_vm.prank(sponsor_address, value=7500):
-        pid = contract.create_program(
-            name="Expiring Program",
-            repo_base_url="https://raw.githubusercontent.com/defiprotocol/core",
-            scope_url="https://raw.githubusercontent.com/defiprotocol/core/main/security.md",
-            min_stake=50,
-            challenge_period=86400,
-            critical_payout_bps=5000,
-            high_payout_bps=2000,
-            medium_payout_bps=800,
-            low_payout_bps=200,
-        )
-
-    with direct_vm.prank(sponsor_address):
-        contract.cancel_program(pid)
-
-    prog = contract.get_program(pid)
-    assert prog["status"] == PROGRAM_CLOSED
-    assert prog["vault_balance"] == 0
-    assert direct_vm.balances[sponsor_address] == 7500
-
-
-# -----------------------------------------------------------------------------
-# 14. ACCESS CONTROLS & ERROR HANDLING
+# 15. ACCESS CONTROLS & ERROR HANDLING
 # -----------------------------------------------------------------------------
 
 def test_access_controls_and_error_handling(

@@ -67,9 +67,11 @@ class BountyProgram:
     name: str
     repo_base_url: str             # Base URL for authoritative code acquisition (e.g. raw GitHub URL)
     scope_url: str                 # Public URL defining program scope (e.g. GitHub security.md)
-    vault_balance: u256             # Active native funds available for bounties
+    vault_balance: u256             # Active unreserved native funds available for new bounties
+    reserved_payouts: u256          # Funds quarantined for adjudicated or challenged reports
+    active_reports_count: u64      # Number of active unresolved reports (submitted, adjudicated, challenged)
     min_stake: u256                 # Anti-spam deposit required per submission
-    challenge_period: u64          # Timelock duration in seconds before researcher can claim
+    challenge_period: u64          # Timelock duration in seconds before researcher can claim / resolution window
     critical_payout_bps: u64       # Basis points of vault for CRITICAL (e.g., 5000 = 50%)
     high_payout_bps: u64           # Basis points of vault for HIGH (e.g., 2000 = 20%)
     medium_payout_bps: u64         # Basis points of vault for MEDIUM (e.g., 800 = 8%)
@@ -93,10 +95,11 @@ class BugReport:
     status: u64                    # Current report lifecycle state
     adjudicated_severity: str      # Consensus-agreed canonical severity band
     adjudicated_cvss_x10: u64      # Consensus-agreed CVSS v3.1 score * 10
-    payout_amount: u256            # Final calculated native reward
+    payout_amount: u256            # Final calculated native reward (reserved in program)
     submission_timestamp: u64
     adjudication_timestamp: u64
     challenge_deadline: u64        # Timestamp when researcher can claim without sponsor action
+    challenge_resolution_deadline: u64 # Bounded timestamp when challenge defaults to researcher
     triage_summary: str            # Adjudication rationale summary
 
 
@@ -349,14 +352,13 @@ class AgenticBugBounty(gl.Contract):
 
     Enables decentralized protocols to deploy trustless bounty programs where:
     1. Protocol sponsors lock native token vaults, declare repository base URLs, and publish scopes.
-    2. Security researchers stake anti-spam bonds to submit vulnerability PoCs.
-    3. GenLayer validators acquire the authoritative target source code at the specified commit,
+    2. Adjudicated obligations are immediately quarantined and reserved, preventing insolvency.
+    3. Challenges have a bounded lifecycle with explicit resolution paths and default expiries.
+    4. Program cancellation and withdrawals strictly require zero active or pending reports.
+    5. Security researchers stake anti-spam bonds to submit vulnerability PoCs.
+    6. GenLayer validators acquire the authoritative target source code at the specified commit,
        cross-reference scope, evaluate impact via CVSS v3.1, and enforce strict canonical equivalence.
-    4. Slashed anti-spam bonds from fraudulent/spam submissions replenish the vault.
-    5. On-chain timelocks enforce that researchers cannot claim payouts before the
-       challenge window elapses, while sponsors retain early-settlement privileges.
-    6. Native funds are safely tracked and distributed with exact accounting and
-       immediate excess refunds.
+    7. Native funds are safely tracked and distributed with exact accounting and immediate excess refunds.
     """
 
     treasury: Address
@@ -425,6 +427,8 @@ class AgenticBugBounty(gl.Contract):
             repo_base_url=repo_base_url.strip(),
             scope_url=scope_url.strip(),
             vault_balance=initial_vault,
+            reserved_payouts=u256(0),
+            active_reports_count=u64(0),
             min_stake=u256(min_stake),
             challenge_period=u64(challenge_period),
             critical_payout_bps=u64(critical_payout_bps),
@@ -474,7 +478,7 @@ class AgenticBugBounty(gl.Contract):
     ) -> int:
         """
         Submits a vulnerability report with an anti-spam staking bond.
-        Requires target component path and commit SHA for authoritative code acquisition.
+        Increments program.active_reports_count to prevent insolvency.
         Verifies exact stake coverage and immediately refunds any excess value sent.
         Sanitizes inputs against prompt injection patterns.
         """
@@ -516,6 +520,8 @@ class AgenticBugBounty(gl.Contract):
         report_id = self.report_counter
 
         self.total_bonds_locked += required_stake
+        program.active_reports_count += u64(1)
+        self.programs[u_id] = program
 
         current_time = u64(gl.block.timestamp)
         report = BugReport(
@@ -535,6 +541,7 @@ class AgenticBugBounty(gl.Contract):
             submission_timestamp=current_time,
             adjudication_timestamp=u64(0),
             challenge_deadline=u64(0),
+            challenge_resolution_deadline=u64(0),
             triage_summary="",
         )
 
@@ -552,7 +559,7 @@ class AgenticBugBounty(gl.Contract):
         - Non-deterministic callbacks fetch authoritative target source code and scope.
         - The callback closures reference ONLY local primitives; zero contract storage is reachable.
         - Equivalence check strictly binds canonical severity bands.
-        - Payout amount is deterministically derived from program vault state.
+        - Adjudicated payouts are immediately quarantined and reserved into program.reserved_payouts.
         - Fraudulent/spam reports forfeit their anti-spam bond into the vault.
         """
         u_id = u256(report_id)
@@ -628,30 +635,42 @@ class AgenticBugBounty(gl.Contract):
             program.vault_balance += slashed_amount
             self.total_vault_locked += slashed_amount
             report.staked_bond = u256(0)
+
+            # Decrement active reports count since report reached terminal rejected state
+            program.active_reports_count -= u64(1)
             self.programs[program.program_id] = program
         else:
-            # Report is valid: calculate deterministic payout from canonical band
+            # Report is valid: calculate deterministic payout and RESERVE IT IMMEDIATELY
             report.status = u64(REPORT_ADJUDICATED)
             report.adjudicated_severity = canonical_severity
             report.adjudicated_cvss_x10 = u64(cvss_x10)
             report.challenge_deadline = current_time + program.challenge_period
-            report.payout_amount = self._calculate_payout(program, canonical_severity)
+
+            payout = self._calculate_payout(program, canonical_severity)
+            if payout > program.vault_balance:
+                payout = program.vault_balance
+
+            # Reserve adjudicated obligation: deduct from unreserved vault into reserved pool
+            program.vault_balance -= payout
+            program.reserved_payouts += payout
+            report.payout_amount = payout
+            self.programs[program.program_id] = program
 
         self.reports[u_id] = report
 
     # -------------------------------------------------------------------------
-    # SETTLEMENT & CHALLENGE PATHS (ESCROW ROUTING)
+    # SETTLEMENT & CHALLENGE PATHS (ESCROW ROUTING & TIMELOCK)
     # -------------------------------------------------------------------------
 
     @gl.public.write
     def settle_payout(self, report_id: int) -> None:
         """
-        Settles an adjudicated bug bounty and distributes native funds.
+        Settles an adjudicated bug bounty from reserved payouts and distributes native funds.
         Enforces on-chain timelock:
-        - Sponsor may approve early at any time.
+        - Sponsor may approve early at any time during challenge window.
         - Researcher CANNOT claim before the challenge deadline has elapsed.
         Distributes:
-        - Deterministic bounty payout + 100% refunded anti-spam bond to researcher.
+        - Reserved bounty payout + 100% refunded anti-spam bond to researcher.
         """
         u_id = u256(report_id)
         if u_id not in self.reports:
@@ -679,15 +698,17 @@ class AgenticBugBounty(gl.Contract):
         payout = report.payout_amount
         bond_refund = report.staked_bond
 
-        if payout > program.vault_balance:
-            raise gl.vm.UserError(f"{ERR_EXPECTED} Insufficient vault balance for payout")
+        if payout > program.reserved_payouts:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Insolvent reserved payouts bookkeeping")
 
-        # Update protocol bookkeeping
-        program.vault_balance -= payout
+        # Deduct from reserved obligations pool and unlock bonds
+        program.reserved_payouts -= payout
         self.total_vault_locked -= payout
         self.total_bonds_locked -= bond_refund
+        program.active_reports_count -= u64(1)
 
         report.status = u64(REPORT_SETTLED)
+        report.staked_bond = u256(0)
         self.reports[u_id] = report
         self.programs[program.program_id] = program
 
@@ -699,8 +720,8 @@ class AgenticBugBounty(gl.Contract):
     @gl.public.write
     def challenge_report(self, report_id: int, reason: str) -> None:
         """
-        Allows the program sponsor to challenge an adjudicated report during the challenge window
-        (e.g., in case of duplicate report, prior known issue, or internal dispute).
+        Allows the program sponsor to challenge an adjudicated report during the challenge window.
+        Establishes a bounded challenge_resolution_deadline preventing indefinite lockup.
         """
         u_id = u256(report_id)
         if u_id not in self.reports:
@@ -708,7 +729,7 @@ class AgenticBugBounty(gl.Contract):
 
         report = self.reports[u_id]
         if report.status != u64(REPORT_ADJUDICATED):
-            raise gl.vm.UserError(f"{ERR_EXPECTED} Report is not in ADJUDICATED status")
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Report must be in ADJUDICATED status to challenge")
 
         program = self.programs[report.program_id]
         if gl.message.sender_address != program.sponsor:
@@ -719,13 +740,136 @@ class AgenticBugBounty(gl.Contract):
             raise gl.vm.UserError(f"{ERR_EXPECTED} Challenge window has expired")
 
         report.status = u64(REPORT_CHALLENGED)
+        # Bounded resolution window: sponsor must resolve within challenge_period, or it defaults to researcher
+        report.challenge_resolution_deadline = current_time + program.challenge_period
         report.triage_summary = f"CHALLENGED: {reason[:200]}"
         self.reports[u_id] = report
 
     @gl.public.write
+    def resolve_challenge(
+        self,
+        report_id: int,
+        uphold_claim: bool,
+        slash_bond: bool,
+        resolution_notes: str,
+    ) -> None:
+        """
+        Bounded resolution path for challenged reports executed by the sponsor:
+        - uphold_claim=True: Concedes report is valid -> distributes reserved payout + bond to researcher.
+        - uphold_claim=False: Sustains challenge -> returns reserved payout to unreserved vault.
+          - slash_bond=True: Confiscates bond into vault (fraudulent/spam).
+          - slash_bond=False: Refunds bond to researcher (good-faith duplicate/prior finding).
+        """
+        u_id = u256(report_id)
+        if u_id not in self.reports:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Report does not exist")
+
+        report = self.reports[u_id]
+        if report.status != u64(REPORT_CHALLENGED):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Report is not in CHALLENGED status")
+
+        program = self.programs[report.program_id]
+        if gl.message.sender_address != program.sponsor:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Only program sponsor can resolve challenge")
+
+        payout = report.payout_amount
+        bond = report.staked_bond
+
+        if uphold_claim:
+            # Uphold researcher claim: settle payout + refund bond
+            if payout > program.reserved_payouts:
+                raise gl.vm.UserError(f"{ERR_EXPECTED} Insolvent reserved payouts bookkeeping")
+
+            program.reserved_payouts -= payout
+            self.total_vault_locked -= payout
+            self.total_bonds_locked -= bond
+            program.active_reports_count -= u64(1)
+
+            report.status = u64(REPORT_SETTLED)
+            report.staked_bond = u256(0)
+            report.triage_summary = f"CHALLENGE_RESOLVED_UPHELD: {resolution_notes[:150]}"
+            self.reports[u_id] = report
+            self.programs[program.program_id] = program
+
+            total_transfer = payout + bond
+            if total_transfer > u256(0):
+                gl.get_contract_at(report.researcher).emit_transfer(value=total_transfer)
+        else:
+            # Challenge sustained: unreserve payout and return capital to unreserved vault
+            if payout > program.reserved_payouts:
+                raise gl.vm.UserError(f"{ERR_EXPECTED} Insolvent reserved payouts bookkeeping")
+
+            program.reserved_payouts -= payout
+            program.vault_balance += payout
+            report.payout_amount = u256(0)
+            program.active_reports_count -= u64(1)
+
+            if slash_bond:
+                # Slash researcher bond into program vault
+                self.total_bonds_locked -= bond
+                program.vault_balance += bond
+                self.total_vault_locked += bond
+                report.staked_bond = u256(0)
+            else:
+                # Refund researcher bond (good faith duplicate)
+                self.total_bonds_locked -= bond
+                report.staked_bond = u256(0)
+                if bond > u256(0):
+                    gl.get_contract_at(report.researcher).emit_transfer(value=bond)
+
+            report.status = u64(REPORT_REJECTED)
+            report.triage_summary = f"CHALLENGE_RESOLVED_DISMISSED: {resolution_notes[:150]}"
+            self.reports[u_id] = report
+            self.programs[program.program_id] = program
+
+    @gl.public.write
+    def claim_expired_challenge(self, report_id: int) -> None:
+        """
+        Bounded default settlement:
+        If sponsor fails to resolve a challenge within challenge_resolution_deadline,
+        researcher (or anyone) can trigger default settlement to prevent indefinite lockup.
+        """
+        u_id = u256(report_id)
+        if u_id not in self.reports:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Report does not exist")
+
+        report = self.reports[u_id]
+        if report.status != u64(REPORT_CHALLENGED):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Report is not in CHALLENGED status")
+
+        program = self.programs[report.program_id]
+        current_time = u64(gl.block.timestamp)
+
+        if current_time <= report.challenge_resolution_deadline:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Challenge resolution period has not yet elapsed")
+
+        payout = report.payout_amount
+        bond = report.staked_bond
+
+        if payout > program.reserved_payouts:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Insolvent reserved payouts bookkeeping")
+
+        program.reserved_payouts -= payout
+        self.total_vault_locked -= payout
+        self.total_bonds_locked -= bond
+        program.active_reports_count -= u64(1)
+
+        report.status = u64(REPORT_SETTLED)
+        report.staked_bond = u256(0)
+        report.triage_summary = "CHALLENGE_EXPIRED_DEFAULT_SETTLEMENT"
+        self.reports[u_id] = report
+        self.programs[program.program_id] = program
+
+        total_transfer = payout + bond
+        if total_transfer > u256(0):
+            gl.get_contract_at(report.researcher).emit_transfer(value=total_transfer)
+
+    @gl.public.write
     def cancel_program(self, program_id: int) -> None:
         """
-        Sponsor can close an active program and withdraw remaining vault balance.
+        Sponsor can close an active program and withdraw unreserved vault balance
+        ONLY IF all submitted, adjudicated, and challenged reports are fully resolved.
+        Prevents cancellation from making outstanding reports insolvent.
         """
         u_id = u256(program_id)
         if u_id not in self.programs:
@@ -737,6 +881,17 @@ class AgenticBugBounty(gl.Contract):
         if program.status != u64(PROGRAM_ACTIVE):
             raise gl.vm.UserError(f"{ERR_EXPECTED} Program is not active")
 
+        # Insolvency prevention: cannot cancel while reports are pending or reserved
+        if program.active_reports_count > u64(0):
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED} Cannot cancel program with {program.active_reports_count} active reports. "
+                "All submitted, adjudicated, and challenged reports must be settled or rejected first."
+            )
+        if program.reserved_payouts > u256(0):
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED} Cannot cancel program with reserved obligations ({program.reserved_payouts}) pending settlement."
+            )
+
         refund = program.vault_balance
         program.vault_balance = u256(0)
         self.total_vault_locked -= refund
@@ -746,12 +901,45 @@ class AgenticBugBounty(gl.Contract):
         if refund > u256(0):
             gl.get_contract_at(program.sponsor).emit_transfer(value=refund)
 
+    @gl.public.write
+    def withdraw_vault(self, program_id: int, amount: int) -> None:
+        """
+        Sponsor can withdraw available unreserved vault funds ONLY if there are no active reports.
+        Guarantees that withdrawals never make submitted, adjudicated, or challenged reports insolvent.
+        """
+        u_id = u256(program_id)
+        if u_id not in self.programs:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Program does not exist")
+
+        program = self.programs[u_id]
+        if gl.message.sender_address != program.sponsor:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Only program sponsor can withdraw from vault")
+        if program.status != u64(PROGRAM_ACTIVE):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Program is not active")
+
+        if program.active_reports_count > u64(0):
+            raise gl.vm.UserError(
+                f"{ERR_EXPECTED} Cannot withdraw while {program.active_reports_count} reports are active or pending."
+            )
+
+        withdraw_amt = u256(amount)
+        if withdraw_amt == u256(0):
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Withdrawal amount must be greater than zero")
+        if withdraw_amt > program.vault_balance:
+            raise gl.vm.UserError(f"{ERR_EXPECTED} Insufficient unreserved vault balance for withdrawal")
+
+        program.vault_balance -= withdraw_amt
+        self.total_vault_locked -= withdraw_amt
+        self.programs[u_id] = program
+
+        gl.get_contract_at(program.sponsor).emit_transfer(value=withdraw_amt)
+
     # -------------------------------------------------------------------------
     # INTERNAL HELPERS
     # -------------------------------------------------------------------------
 
     def _calculate_payout(self, program: BountyProgram, canonical_sev: str) -> u256:
-        """Deterministically derives native payout from canonical band and vault balance."""
+        """Deterministically derives native payout from canonical band and unreserved vault balance."""
         vault = program.vault_balance
         if canonical_sev == SEVERITY_CRITICAL:
             bps = program.critical_payout_bps
@@ -793,6 +981,8 @@ class AgenticBugBounty(gl.Contract):
             "repo_base_url": p.repo_base_url,
             "scope_url": p.scope_url,
             "vault_balance": int(p.vault_balance),
+            "reserved_payouts": int(p.reserved_payouts),
+            "active_reports_count": int(p.active_reports_count),
             "min_stake": int(p.min_stake),
             "challenge_period": int(p.challenge_period),
             "critical_payout_bps": int(p.critical_payout_bps),
@@ -825,6 +1015,7 @@ class AgenticBugBounty(gl.Contract):
             "submission_timestamp": int(r.submission_timestamp),
             "adjudication_timestamp": int(r.adjudication_timestamp),
             "challenge_deadline": int(r.challenge_deadline),
+            "challenge_resolution_deadline": int(r.challenge_resolution_deadline),
             "triage_summary": r.triage_summary,
         }
 
