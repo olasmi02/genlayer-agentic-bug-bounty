@@ -9,3 +9,6 @@ htmlcov/
 .venv
 env/
 venv/
+*key*.json
+*.key
+*secret*
